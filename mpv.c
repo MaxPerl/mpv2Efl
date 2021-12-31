@@ -9,7 +9,9 @@
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
 
+static int count = 0;
 static int render_event;
+
 typedef struct _cb_data cbd;
 
 struct _cb_data
@@ -17,6 +19,7 @@ struct _cb_data
    Evas_Object *glview;
    mpv_handle   *mpv;
    mpv_render_context *mpv_gl;
+   GLuint fbo;
 };
 
 static cbd *cb_data = NULL;
@@ -36,12 +39,17 @@ static void *get_proc_address(void *fn_ctx, const char *name)
 }
 
 void _render_update(void *ctx) {
-    printf("CALL RENDER\n");
-    ecore_event_add(render_event,NULL, NULL,NULL); 
-    //evas_object_smart_callback_call(gl,"render",NULL);
+    printf("CALL RENDER %d\n",count);
+    count = 1;
+    
 }
 
-Eina_Bool _on_render(void *data, int type, void *event)
+Eina_Bool render_event_cb(void *data, int type, void *ev) {
+    elm_glview_changed_set(cb_data->glview);
+    return 1;
+}
+
+void _on_render(Evas_Object *obj)
 {
     mpv_render_context *mpv_gl = cb_data->mpv_gl;
     Evas_Object *gl = cb_data->glview;
@@ -57,10 +65,13 @@ Eina_Bool _on_render(void *data, int type, void *event)
             // in a smaller rectangle or apply fancy transformations, you'll
             // need to render into a separate FBO and draw it manually.
             {MPV_RENDER_PARAM_OPENGL_FBO, &(mpv_opengl_fbo){
-                .fbo = 0,
-                .w = w,
-                .h = h,
-            }}
+                    .fbo = 0,
+                    .w = w,
+                    .h = h,
+            }},
+            // Flip rendering (needed due to flipped GL coordinate system).
+            {MPV_RENDER_PARAM_FLIP_Y, &(int){1}},
+            {0}
         };
         // See render_gl.h on what OpenGL environment mpv expects, and
         // other API details.
@@ -72,22 +83,50 @@ static Eina_Bool
 on_mpv(void *data)
 {
     mpv_handle *mpv = data;
-    
     while (1) {
+                    //printf("COUNT %d",count);
+                    if (count) {
+                        count = 0;
+                        ecore_event_add(render_event,NULL, NULL,NULL);
+                    }
                     mpv_event *mp_event = mpv_wait_event(mpv, 0);
                     if (mp_event->event_id == MPV_EVENT_NONE)
                         break;
+                    if (mp_event->event_id == MPV_EVENT_LOG_MESSAGE) {
+                        mpv_event_log_message *msg = mp_event->data;
+                        // Print log messages about DR allocations, just to
+                        // test whether it works. If there is more than 1 of
+                        // these, it works. (The log message can actually change
+                        // any time, so it's possible this logging stops working
+                        // in the future.)
+                        if (strstr(msg->text, "DR image"))
+                            printf("log: %s", msg->text);
+                        continue;
+                    }
+//                     ´
                 }
    // Let the event continue to other callbacks which have not been called yet
    return ECORE_CALLBACK_PASS_ON;
 }
 
-void _init_gl(Evas_Object *gl) {
+void _init_gl(Evas_Object *glview) {
+    
     mpv_render_param params[] = {
         {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_OPENGL},
         {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &(mpv_opengl_init_params){
-            .get_proc_address = get_proc_address, gl,
-        }}
+            .get_proc_address = get_proc_address, glview,
+        }},
+        // Tell libmpv that you will call mpv_render_context_update() on render
+        // context update callbacks, and that you will _not_ block on the core
+        // ever (see <libmpv/render.h> "Threading" section for what libmpv
+        // functions you can call at all when this is active).
+        // In particular, this means you must call e.g. mpv_command_async()
+        // instead of mpv_command().
+        // If you want to use synchronous calls, either make them on a separate
+        // thread, or remove the option below (this will disable features like
+        // DR and is not recommended anyway).
+        //{MPV_RENDER_PARAM_ADVANCED_CONTROL, &(int){1}},
+        {0}
     };
 
     // This makes mpv use the currently set GL context. It will use the callback
@@ -96,9 +135,6 @@ void _init_gl(Evas_Object *gl) {
     mpv_render_context *mpv_gl;
     if (mpv_render_context_create(&mpv_gl, cb_data->mpv, params) < 0)
         die("failed to initialize mpv GL context");
-    
-    render_event = ecore_event_type_new();
-    ecore_event_handler_add(render_event,_on_render,NULL);
     
     cb_data->mpv_gl = mpv_gl;
     
@@ -109,12 +145,9 @@ void _init_gl(Evas_Object *gl) {
     // request a new frame to be rendered.
     // (Separate from the normal event handling mechanism for the sake of
     //  users which run OpenGL on a different thread.)
+    render_event = ecore_event_type_new();
+    ecore_event_handler_add(render_event,render_event_cb,NULL);
     mpv_render_context_set_update_callback(mpv_gl, _render_update, NULL);
-    
-}
-
-void _draw_gl(Evas_Object *gl) {
-    
     
 }
 
@@ -123,6 +156,7 @@ int main(int argc, char *argv[])
 {
     Evas_Object *win, *bx, *gl;
     if (!(cb_data = calloc(1, sizeof(cbd)))) return 1;
+
     
     //elm_config_engine_set("opengl_x11");
     //elm_config_accel_preference_set("opengl");
@@ -140,28 +174,14 @@ int main(int argc, char *argv[])
     elm_win_resize_object_add(win, bx);
     evas_object_show(bx);
 
-    //-//-//-// THIS IS WHERE GL INIT STUFF HAPPENS (ALA EGL)
-    //-//
-    // create a new glview object
     gl = elm_glview_add(win);
     evas_object_size_hint_align_set(gl, EVAS_HINT_FILL, EVAS_HINT_FILL);
     evas_object_size_hint_weight_set(gl, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
-    // mode is simply for supporting alpha, depth buffering, and stencil
-   // buffering.
-   elm_glview_mode_set(gl, ELM_GLVIEW_DEPTH_24);
-   // resize policy tells glview what to do with the surface when it
-   // resizes.  ELM_GLVIEW_RESIZE_POLICY_RECREATE will tell it to
-   // destroy the current surface and recreate it to the new size
-   elm_glview_resize_policy_set(gl, ELM_GLVIEW_RESIZE_POLICY_RECREATE);
-   // render policy tells glview how it would like glview to render
-   // gl code. ELM_GLVIEW_RENDER_POLICY_ON_DEMAND will have the gl
-   // calls called in the pixel_get callback, which only gets called
-   // if the object is visible, hence ON_DEMAND.  ALWAYS mode renders
-   // it despite the visibility of the object.
-   elm_glview_render_policy_set(gl, ELM_GLVIEW_RENDER_POLICY_ON_DEMAND);
-   // initialize callback function gets registered here
-   elm_glview_init_func_set(gl, _init_gl);
-   elm_glview_render_func_set(gl, _draw_gl);
+    elm_glview_mode_set(gl, ELM_GLVIEW_ALPHA | ELM_GLVIEW_DEPTH);
+    elm_glview_resize_policy_set(gl, ELM_GLVIEW_RESIZE_POLICY_RECREATE);
+    elm_glview_render_policy_set(gl, ELM_GLVIEW_RENDER_POLICY_ALWAYS);
+    elm_glview_init_func_set(gl, _init_gl);
+    elm_glview_render_func_set(gl, _on_render);
     
     elm_box_pack_end(bx, gl);
     evas_object_show(gl);
@@ -196,9 +216,9 @@ int main(int argc, char *argv[])
             
     // Destroy the GL renderer and all of the GL objects it allocated. If video
     // is still running, the video track will be deselected.
-    //mpv_render_context_free(mpv_gl);
+    mpv_render_context_free(cb_data->mpv_gl);
 
-    //mpv_detach_destroy(mpv);
+    mpv_terminate_destroy(mpv);
     elm_shutdown();
 
     printf("properly terminated\n");
